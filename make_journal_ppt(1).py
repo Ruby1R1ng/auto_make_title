@@ -1071,11 +1071,30 @@ def translate_text_google(text: str, target_lang: str = "zh-CN", source_lang: st
     return "".join(pieces).strip()
 
 
+def translate_text_google_with_retry(
+    text: str,
+    target_lang: str = "zh-CN",
+    source_lang: str = "auto",
+    attempts: int = 3,
+    retry_sleep_s: float = 0.6,
+) -> str:
+    last_err: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return translate_text_google(text, target_lang=target_lang, source_lang=source_lang)
+        except Exception as exc:
+            last_err = exc
+            if attempt < max(1, attempts):
+                time.sleep(retry_sleep_s)
+    assert last_err is not None
+    raise last_err
+
+
 def enrich_translations(items: list[dict[str, str]], sleep_s: float = 0.2) -> None:
     for i, item in enumerate(items, 1):
         title = item["title"]
         try:
-            item["title_zh"] = translate_text_google(title)
+            item["title_zh"] = translate_text_google_with_retry(title, attempts=3)
         except Exception:
             item["title_zh"] = title
         if i != len(items):
