@@ -444,6 +444,176 @@ def extract_ieee_issue_entries_from_html(html_text: str, count: int) -> list[dic
     return candidates
 
 
+def parse_ieee_issue_params(page_url: str) -> dict[str, str]:
+    parsed = urllib.parse.urlparse(page_url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    return {
+        "publication_number": (qs.get("punumber") or [""])[0],
+        "issue_number": (qs.get("isnumber") or [""])[0],
+        "sort_type": (qs.get("sortType") or [""])[0],
+        "rows_per_page": (qs.get("rowsPerPage") or [""])[0],
+        "page_number": (qs.get("pageNumber") or ["1"])[0],
+    }
+
+
+def extract_ieee_items_via_api(page_url: str, count: int, wait_s: float = 8.0) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    params = parse_ieee_issue_params(page_url)
+    pub = params["publication_number"]
+    issue = params["issue_number"]
+    if not pub or not issue:
+        raise FetchError(f"IEEE issue URL is missing punumber/isnumber: {page_url}")
+
+    rows = max(count, int(params["rows_per_page"] or "25"))
+    start_page = max(1, int(params["page_number"] or "1"))
+    sort_type = params["sort_type"]
+
+    ws_url, launched_proc, launched_profile = cdp_get_or_create_page_ws_auto(
+        page_url,
+        auto_launch=True,
+        headless=False,
+    )
+    ws = SimpleWebSocket(ws_url)
+    ws.connect()
+    try:
+        cid = 1
+        cdp_call(ws, cid, "Page.enable"); cid += 1
+        cdp_call(ws, cid, "Runtime.enable"); cid += 1
+        cdp_call(ws, cid, "Page.navigate", {"url": page_url}, wait_s=20.0); cid += 1
+        time.sleep(10.0)
+        consent_expr = """
+(() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"]'));
+  const match = buttons.find((el) => {
+    const text = norm(el.innerText || el.textContent || el.value || '');
+    return (
+      text === 'accept' ||
+      text === 'i accept' ||
+      text.includes('accept all') ||
+      text.includes('accept cookies') ||
+      text === '接受' ||
+      text.includes('接受全部')
+    );
+  });
+  if (match) {
+    match.click();
+    return true;
+  }
+  return false;
+})()
+"""
+        cdp_call(ws, cid, "Runtime.evaluate", {"expression": consent_expr, "returnByValue": True}, wait_s=10.0); cid += 1
+        time.sleep(4.0)
+
+        fetch_expr = f"""
+(async () => {{
+  const banned = /table of contents|publication information|society information/i;
+  const pub = {json.dumps(pub)};
+  const issue = {json.dumps(issue)};
+  const rows = {rows};
+  const startPage = {start_page};
+  const needed = {count};
+  const sortType = {json.dumps(sort_type)};
+  const meta = await fetch(`/rest/publication/${{pub}}/issue/${{issue}}/metadata`, {{
+    credentials: 'include'
+  }}).then(r => r.json());
+
+  const items = [];
+  let totalRecords = 0;
+  let totalPages = 1;
+  let page = startPage;
+  while (items.length < needed && page <= totalPages) {{
+    const body = {{ pageNumber: page, rowsPerPage: rows }};
+    if (sortType) body.sortType = sortType;
+    const toc = await fetch(`/rest/search/pub/${{pub}}/issue/${{issue}}/toc`, {{
+      method: 'POST',
+      credentials: 'include',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }}).then(r => r.json());
+
+    totalRecords = toc.totalRecords || totalRecords || 0;
+    totalPages = toc.totalPages || totalPages || 1;
+    const records = Array.isArray(toc.records) ? toc.records : [];
+    for (const rec of records) {{
+      const title = (rec.articleTitle || '').replace(/\\s+/g, ' ').trim();
+      if (!title || banned.test(title)) continue;
+      const authors = Array.isArray(rec.authors)
+        ? rec.authors.map(a => (a.preferredName || a.name || '')).filter(Boolean).join('; ')
+        : '';
+      items.push({{
+        title,
+        authors: authors || 'Unknown',
+        title_zh: '',
+        source: 'IEEE-API',
+      }});
+      if (items.length >= needed) break;
+    }}
+    page += 1;
+  }}
+
+  return {{
+    meta: {{
+      title: meta.publicationTitle || 'IEEE Journal',
+      volume: meta.volume || 'Unknown',
+      issue: meta.issue || '',
+      year: meta.year || '',
+      month: meta.month || '',
+      totalRecords,
+      totalPages,
+    }},
+    items,
+    pageTitle: document.title || '',
+  }};
+}})()
+"""
+        result = cdp_call(
+            ws,
+            cid,
+            "Runtime.evaluate",
+            {"expression": fetch_expr, "returnByValue": True, "awaitPromise": True},
+            wait_s=max(40.0, wait_s * 5),
+        )
+        value = (((result.get("result") or {}).get("result") or {}).get("value"))
+        if not value or not value.get("items"):
+            raise FetchError(f"IEEE API extraction failed for URL: {page_url} | page_title={(value or {}).get('pageTitle', '')!r}")
+        meta = value.get("meta") or {}
+        items = [
+            {
+                "title": normalize_title(it.get("title", "")),
+                "authors": normalize_title(it.get("authors", "")) or "Unknown",
+                "title_zh": "",
+                "source": "IEEE-API",
+            }
+            for it in value.get("items", [])
+            if normalize_title(it.get("title", ""))
+        ]
+        return {
+            "title": meta.get("title") or "IEEE Journal",
+            "volume": str(meta.get("volume") or "Unknown"),
+            "issue": str(meta.get("issue") or ""),
+            "year": str(meta.get("year") or ""),
+            "month": str(meta.get("month") or ""),
+            "source_url": page_url,
+            "total_records": meta.get("totalRecords") or len(items),
+            "total_pages": meta.get("totalPages") or 1,
+        }, items[:count]
+    finally:
+        ws.close()
+        if launched_proc is not None:
+            try:
+                launched_proc.terminate()
+                launched_proc.wait(timeout=5)
+            except Exception:
+                pass
+        if launched_profile:
+            try:
+                import shutil
+                shutil.rmtree(launched_profile, ignore_errors=True)
+            except Exception:
+                pass
+
+
 def find_browser_executable() -> str:
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -721,6 +891,12 @@ def extract_items_via_browser(page_url: str, count: int, wait_s: float = 8.0) ->
 def extract_items_from_url_page(page_url: str, count: int, strict_order: bool = False) -> tuple[dict[str, Any], list[dict[str, str]]]:
     if strict_order:
         return extract_items_via_browser(page_url, count)
+
+    if "ieeexplore.ieee.org" in page_url.lower() and "isnumber=" in page_url.lower() and "punumber=" in page_url.lower():
+        try:
+            return extract_ieee_items_via_api(page_url, count)
+        except Exception:
+            pass
 
     html_text = ""
     try:
