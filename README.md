@@ -6,4 +6,5 @@ uv run python ".\make_journal_ppt(1).py" --url "https://ieeexplore.ieee.org/xpl/
 
 AUTO
 
-uv run python ".\auto.py" --url "https://ieeexplore.ieee.org/xpl/tocresult.jsp?isnumber=11417357&punumber=9&sortType=vol-only-seq&rowsPerPage=75&pageNumber=1" --count 35
+ & .venv\Scripts\python.exe make_journal_ppt.py --url "https://www.sciencedirect.com/journal/automatica/vol/188/suppl/C" --count 50 --strict-order
+
